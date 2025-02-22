@@ -1,0 +1,5 @@
+botserver
+uWebSockets
+uSockets
+json.hpp
+*.log

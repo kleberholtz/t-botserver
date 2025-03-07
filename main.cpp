@@ -135,9 +135,10 @@ void processMessage(uWS::WebSocket<SSL, true>* ws, std::string_view& raw_message
         userData->packetsTime = time(nullptr) + 1;
         userData->packets = 0;
     }
+    
     userData->packets += 1;
     // 250 packets per 2s
-    if(userData->packets > 200 || raw_message.size() > 12 * 1024) {
+    if(userData->packets > 300 || raw_message.size() > 10 * 1024) {
         blocked += 1;
         ws->end();
         return;                                
@@ -187,8 +188,8 @@ void processMessage(uWS::WebSocket<SSL, true>* ws, std::string_view& raw_message
     dispatchMessage(std::make_shared<std::string>(userData->channel), std::make_shared<std::string>(response.dump()));    
 }
 
-int main() 
-{    
+int main()
+{
     std::cout << "Starting websocket server on port " << PORT << " using " << THREADS << " threads..." << std::endl;
     
     logFile.open("messages.log", std::ios::out | std::ios::app);
@@ -286,12 +287,11 @@ int main()
         });
     };
     
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     std::cout << "Server online!" << std::endl;
 
     bool working = true;
     while(working) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         std::cout << "Connections: " << connections << " Packets: " << packets << " Exceptions: " << exceptions << " Blocked: " << blocked << std::endl;
         
         // send ping

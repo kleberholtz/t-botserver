@@ -23,9 +23,13 @@
 using namespace std;
 
 vector<string> clusterNodes;
+
 int serverPort = 8000;
 int clusterPort = 8035;
 int threadCount = 4;
+
+ofstream logMessagesFile;
+bool logMessages = false;
 
 using ChannelsMap = map<string, set<uWS::WebSocket<SSL, true> *>>;
 using StringPtr = shared_ptr<string>;
@@ -56,8 +60,6 @@ vector<mutex> mutexes(threadCount);
 vector<thread *> threads(threadCount, nullptr);
 vector<PerThreadData> threads_data(threadCount);
 
-ofstream logFile;
-
 mutex globalMutex;
 map<string, multiset<string>> globalChannels;
 
@@ -73,12 +75,15 @@ string getCurrentTimeAsString()
 {
     auto now = chrono::system_clock::now();
     time_t now_time = chrono::system_clock::to_time_t(now);
-    struct tm *timeinfo = localtime(&now_time);
+    auto ms = chrono::duration_cast<chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-    char buffer[80];
-    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+    struct tm timeinfo;
+    localtime_r(&now_time, &timeinfo); // Para evitar problemas com threads
 
-    return string(buffer);
+    stringstream ss;
+    ss << put_time(&timeinfo, "%Y-%m-%dT%H:%M:%S") << '.' << setfill('0') << setw(3) << ms.count() << "Z";
+
+    return ss.str();
 }
 
 void sendPing()
@@ -104,11 +109,13 @@ void sendPing()
     }
 }
 
-void sendToCluster(const string &channel, const string &message)
+bool sendToCluster(const StringPtr &channel, const StringPtr &message)
 {
+    bool sent = false;
+
     if (clusterNodes.empty())
     {
-        return;
+        return sent;
     }
 
     for (const string &node : clusterNodes)
@@ -126,12 +133,15 @@ void sendToCluster(const string &channel, const string &message)
 
         if (connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) >= 0)
         {
-            string msg = channel + "|" + message;
+            string msg = *channel + "|" + *message;
             send(sock, msg.c_str(), msg.size(), 0);
+            sent = true;
         }
 
         close(sock);
     }
+
+    return sent;
 }
 
 void dispatchMessage(const StringPtr &channel, const StringPtr &message)
@@ -143,8 +153,6 @@ void dispatchMessage(const StringPtr &channel, const StringPtr &message)
         {
             continue;
         }
-
-        sendToCluster(*channel, *message);
 
         threads_data[index].loop->defer([index, channel, message]
                                         {
@@ -185,7 +193,7 @@ void processMessage(uWS::WebSocket<SSL, true> *ws, string_view &raw_message, Cha
         }
 
         auto it = channels->find(userData->channel);
-        if (it != channels->end() && it->second.size() > 75)
+        if (it != channels->end() && it->second.size() > 60)
         {
             blocked += 1;
             ws->end();
@@ -206,8 +214,8 @@ void processMessage(uWS::WebSocket<SSL, true> *ws, string_view &raw_message, Cha
     }
 
     userData->packets += 1;
-    // 300 packets per 2s
-    if (userData->packets > 300 || raw_message.size() > 10 * 1024)
+    // 200 packets per second
+    if (userData->packets > 200 || raw_message.size() > 10 * 1024)
     {
         blocked += 1;
         ws->end();
@@ -239,9 +247,6 @@ void processMessage(uWS::WebSocket<SSL, true> *ws, string_view &raw_message, Cha
     response["name"] = userData->name;
     response["topic"] = topic;
 
-    // log message
-    // logFile << time(nullptr) << " " << userData->name << " " << userData->channel << " " << topic << " " << msg["message"] << endl;
-
     // special topics
     if (topic == "list")
     { // list of all users
@@ -260,7 +265,22 @@ void processMessage(uWS::WebSocket<SSL, true> *ws, string_view &raw_message, Cha
 
     // relay message
     response["message"] = msg["message"];
-    dispatchMessage(make_shared<string>(userData->channel), make_shared<string>(response.dump()));
+
+    auto channelPtr = make_shared<string>(userData->channel);
+    auto responsePtr = make_shared<string>(response.dump());
+
+    sendToCluster(channelPtr, responsePtr);
+    dispatchMessage(channelPtr, responsePtr);
+
+    // log message
+    if (logMessages && logMessagesFile.is_open())
+    {
+        response["date"] = getCurrentTimeAsString();
+        logMessagesFile <<  response.dump() << endl;
+    }
+
+    // cout << "Dispatching message: " << response.dump() << endl;
+    return;
 }
 
 void clusterListener()
@@ -297,7 +317,7 @@ void clusterListener()
                 string channel = data.substr(0, delimiter);
                 string message = data.substr(delimiter + 1);
 
-                // cout << "Cluster message: " << channel << " " << message << endl;
+                // cout << "Receveid cluster message: " << channel << " " << message << endl;
 
                 dispatchMessage(make_shared<string>(channel), make_shared<string>(message));
             }
@@ -324,7 +344,7 @@ void parseClusterNodes(const string &nodes)
 
 void parseArguments(int argc, char *argv[])
 {
-    string nodes;
+    string cluster_nodes;
     string cluster_port;
     string port;
     string threads;
@@ -334,7 +354,7 @@ void parseArguments(int argc, char *argv[])
         string arg = argv[i];
         if (arg == "--cluster-nodes" && i + 1 < argc)
         {
-            nodes = argv[i + 1];
+            cluster_nodes = argv[i + 1];
         }
         if (arg == "--cluster-port" && i + 1 < argc)
         {
@@ -348,14 +368,18 @@ void parseArguments(int argc, char *argv[])
         {
             threads = argv[i + 1];
         }
+        if (arg == "--log-messages")
+        {
+            logMessages = true;
+        }
     }
 
-    if (nodes.empty())
+    if (cluster_nodes.empty())
     {
         char *envClusters = getenv("CLUSTER_NODES");
         if (envClusters)
         {
-            nodes = string(envClusters);
+            cluster_nodes = string(envClusters);
         }
     }
 
@@ -386,9 +410,9 @@ void parseArguments(int argc, char *argv[])
         }
     }
 
-    if (!nodes.empty())
+    if (!cluster_nodes.empty())
     {
-        parseClusterNodes(nodes);
+        parseClusterNodes(cluster_nodes);
     }
 
     if (!cluster_port.empty())
@@ -406,31 +430,36 @@ void parseArguments(int argc, char *argv[])
         threadCount = stoi(threads);
     }
 
+    cout << "Starting websocket server ";
     if (!clusterNodes.empty())
     {
-        cout << "Starting websocket server (clusterized, nodes: ";
+        cout << "(nodes:";
         for (const auto &node : clusterNodes)
         {
-            cout << node << " ";
+            cout << " " << node;
         }
-        cout << ") on port " << serverPort << " using " << threadCount << " threads..." << endl;
+        cout << ") ";
     }
     else
     {
-        cout << "Starting websocket server (no clustered) on port " << serverPort << " using " << threadCount << " threads..." << endl;
+        cout << "(no clustered) ";
+    }
+
+    cout << "on port " << serverPort << " using " << threadCount << " threads..." << endl;
+
+    if (logMessages && !logMessagesFile.is_open())
+    {
+        logMessagesFile.open("messages.log", ios::out | ios::app);
+        if (!logMessagesFile.is_open())
+        {
+            cerr << "Failed to open messages.log file" << endl;
+        }
     }
 }
 
 int main(int argc, char *argv[])
 {
     parseArguments(argc, argv);
-
-    logFile.open("messages.log", ios::out | ios::app);
-    if (!logFile.is_open())
-    {
-        cout << "Failed to open messages.log file" << endl;
-        return 1;
-    }
 
     thread clusterThread(clusterListener);
 
@@ -522,8 +551,6 @@ int main(int argc, char *argv[])
             delete channels;
             mutexes[index].unlock(); });
     };
-
-    cout << "Server online!" << endl;
 
     bool working = true;
     while (working)

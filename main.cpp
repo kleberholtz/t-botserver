@@ -1,4 +1,3 @@
-  
 #include <App.h>
 #include "json.hpp"
 
@@ -6,124 +5,193 @@
 #include <mutex>
 #include <algorithm>
 #include <thread>
+#include <vector>
 #include <iostream>
 #include <fstream>
 #include <map>
 #include <set>
 #include <atomic>
 #include <ctime>
+#include <string>
+#include <cstring>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <cstdlib>
 
-const int THREADS = 4;
-const int PORT = 8000;
-const bool SSL = false;
+#define SSL false
 
-using ChannelsMap = std::map<std::string, std::set<uWS::WebSocket<SSL, true>*>>;
-using StringPtr = std::shared_ptr<std::string>;
+using namespace std;
 
-struct PerSocketData {
-    std::string name;
-    std::string channel;
+vector<string> clusterNodes;
+int serverPort = 8000;
+int clusterPort = 8030;
+int threadCount = 4;
+
+using ChannelsMap = map<string, set<uWS::WebSocket<SSL, true> *>>;
+using StringPtr = shared_ptr<string>;
+
+struct PerSocketData
+{
+    string name;
+    string channel;
     int64_t lastPing = 0;
     int64_t lastPingSent = 0;
     int64_t packets = 0;
     time_t packetsTime = 0;
 };
 
-struct PerThreadData {
-    uWS::Loop* loop = nullptr;
-    ChannelsMap* channels = nullptr;
+struct PerThreadData
+{
+    uWS::Loop *loop = nullptr;
+    ChannelsMap *channels = nullptr;
 };
-    
-std::ofstream logFile;
 
-std::atomic<int64_t> connections = 0;
-std::atomic<int64_t> exceptions = 0;
-std::atomic<int64_t> blocked = 0;
-std::atomic<int64_t> packets = 0;
-std::atomic<int64_t> messageId = 0;
-std::vector<std::mutex> mutexes(THREADS);
-std::vector<std::thread *> threads(THREADS, nullptr);
-std::vector<PerThreadData> threads_data(THREADS);
+atomic<int64_t> connections = 0;
+atomic<int64_t> exceptions = 0;
+atomic<int64_t> blocked = 0;
+atomic<int64_t> packets = 0;
+atomic<int64_t> messageId = 0;
 
-std::mutex globalMutex;
-std::map<std::string, std::multiset<std::string>> globalChannels;
+vector<mutex> mutexes(threadCount);
+vector<thread *> threads(threadCount, nullptr);
+vector<PerThreadData> threads_data(threadCount);
+
+ofstream logFile;
+
+mutex globalMutex;
+map<string, multiset<string>> globalChannels;
+
+map<string, set<uWS::WebSocket<SSL, true> *>> channels;
+mutex channelMutex;
 
 int64_t millis()
 {
-	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    return chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now().time_since_epoch()).count();
 }
 
-void dispatchMessage(const StringPtr& channel, const StringPtr& message)
+string getCurrentTimeAsString()
 {
-    for(int index = 0; index < THREADS; ++index) {    
-        std::lock_guard<std::mutex> lock(mutexes[index]);
-        if(!threads_data[index].loop) {
+    auto now = chrono::system_clock::now();
+    time_t now_time = chrono::system_clock::to_time_t(now);
+    struct tm *timeinfo = localtime(&now_time);
+
+    char buffer[80];
+    strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", timeinfo);
+
+    return string(buffer);
+}
+
+void sendPing()
+{
+    static string pingStr = "{\"type\":\"ping\",\"ping\":";
+    for (int index = 0; index < threadCount; ++index)
+    {
+        lock_guard<mutex> lock(mutexes[index]);
+        if (!threads_data[index].loop)
+        {
             continue;
         }
 
-        threads_data[index].loop->defer([index, channel, message] {
+        threads_data[index].loop->defer([index]
+                                        {
+            for(auto& channel : *(threads_data[index].channels)) {
+                for(auto& ws : channel.second) {
+                    PerSocketData* userData = (PerSocketData*)(ws->getUserData());
+                    userData->lastPingSent = millis();
+                    ws->send(pingStr + to_string(userData->lastPing) + "}", uWS::TEXT);                    
+                }
+            } });
+    }
+}
+
+void sendToCluster(const string &channel, const string &message)
+{
+    if (clusterNodes.empty())
+    {
+        return;
+    }
+
+    for (const string &node : clusterNodes)
+    {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0)
+        {
+            continue;
+        }
+
+        struct sockaddr_in serverAddr;
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_port = htons(clusterPort);
+        inet_pton(AF_INET, node.c_str(), &serverAddr.sin_addr);
+
+        if (connect(sock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) >= 0)
+        {
+            string msg = channel + "|" + message;
+            send(sock, msg.c_str(), msg.size(), 0);
+        }
+
+        close(sock);
+    }
+}
+
+void dispatchMessage(const StringPtr &channel, const StringPtr &message)
+{
+    for (int index = 0; index < threadCount; ++index)
+    {
+        lock_guard<mutex> lock(mutexes[index]);
+        if (!threads_data[index].loop)
+        {
+            continue;
+        }
+
+        sendToCluster(*channel, *message);
+
+        threads_data[index].loop->defer([index, channel, message]
+                                        {
             auto it = threads_data[index].channels->find(*channel);
             if(it != threads_data[index].channels->end()) {
                 for(auto& ws : it->second) {
                     ws->send(*message, uWS::TEXT);
                 }
-            }
-        });
-    }        
+            } });
+    }
 }
 
-void sendPing()
-{
-    static std::string pingStr = "{\"type\":\"ping\",\"ping\":";
-    for(int index = 0; index < THREADS; ++index) {    
-        std::lock_guard<std::mutex> lock(mutexes[index]);
-        if(!threads_data[index].loop) {
-            continue;
-        }
-
-        threads_data[index].loop->defer([index] {
-            for(auto& channel : *(threads_data[index].channels)) {
-                for(auto& ws : channel.second) {
-                    PerSocketData* userData = (PerSocketData*)(ws->getUserData());
-                    userData->lastPingSent = millis();
-                    ws->send(pingStr + std::to_string(userData->lastPing) + "}", uWS::TEXT);                    
-                }
-            }
-        });
-    }       
-}
-
-void processMessage(uWS::WebSocket<SSL, true>* ws, std::string_view& raw_message, ChannelsMap* channels) 
+void processMessage(uWS::WebSocket<SSL, true> *ws, string_view &raw_message, ChannelsMap *channels)
 {
     packets += 1;
-    PerSocketData* userData = (PerSocketData*)(ws->getUserData());
+    PerSocketData *userData = (PerSocketData *)(ws->getUserData());
     auto msg = nlohmann::json::parse(raw_message);
-    std::string type = msg["type"];
+    string type = msg["type"];
 
-    if(userData->name.empty() || userData->channel.empty()) {
-        if(type != "init") {
+    if (userData->name.empty() || userData->channel.empty())
+    {
+        if (type != "init")
+        {
             ws->end();
             return;
         }
-        
+
         userData->name = msg["name"];
         userData->channel = msg["channel"];
         userData->lastPing = 0;
         userData->lastPingSent = millis();
 
-        if(userData->name.empty() || userData->channel.empty() || userData->name.size() > 35 || userData->channel.size() > 30) {
+        if (userData->name.empty() || userData->channel.empty() || userData->name.size() > 35 || userData->channel.size() > 30)
+        {
             blocked += 1;
             ws->end();
             return;
         }
 
         auto it = channels->find(userData->channel);
-        if(it != channels->end() && it->second.size() > 75) {
+        if (it != channels->end() && it->second.size() > 75)
+        {
             blocked += 1;
             ws->end();
             return;
-        } 
-        
+        }
+
         (*channels)[userData->channel].insert(ws);
         globalMutex.lock();
         globalChannels[userData->channel].insert(userData->name);
@@ -131,33 +199,38 @@ void processMessage(uWS::WebSocket<SSL, true>* ws, std::string_view& raw_message
         return;
     }
 
-    if(userData->packetsTime < time(nullptr)) {
+    if (userData->packetsTime < time(nullptr))
+    {
         userData->packetsTime = time(nullptr) + 1;
         userData->packets = 0;
     }
-    
+
     userData->packets += 1;
-    // 250 packets per 2s
-    if(userData->packets > 300 || raw_message.size() > 10 * 1024) {
+    // 300 packets per 2s
+    if (userData->packets > 300 || raw_message.size() > 10 * 1024)
+    {
         blocked += 1;
         ws->end();
-        return;                                
-    }
-
-    if(type == "ping") {
-        userData->lastPing = millis() - userData->lastPingSent;                        
         return;
     }
 
-    if(type != "message") {
-        ws->end();
-        return;                        
+    if (type == "ping")
+    {
+        userData->lastPing = millis() - userData->lastPingSent;
+        return;
     }
 
-    std::string topic = msg["topic"];
-    if(topic.empty() || topic.size() > 30) {
+    if (type != "message")
+    {
         ws->end();
-        return;                                
+        return;
+    }
+
+    string topic = msg["topic"];
+    if (topic.empty() || topic.size() > 30)
+    {
+        ws->end();
+        return;
     }
 
     nlohmann::json response;
@@ -167,39 +240,204 @@ void processMessage(uWS::WebSocket<SSL, true>* ws, std::string_view& raw_message
     response["topic"] = topic;
 
     // log message
-    // logFile << time(nullptr) << " " << userData->name << " " << userData->channel << " " << topic << " " << msg["message"] << std::endl;
+    // logFile << time(nullptr) << " " << userData->name << " " << userData->channel << " " << topic << " " << msg["message"] << endl;
 
     // special topics
-    if(topic == "list") { // list of all users
-        std::set<std::string> users;
+    if (topic == "list")
+    { // list of all users
+        set<string> users;
         globalMutex.lock();
         auto it = globalChannels.find(userData->channel);
-        if(it != globalChannels.end()) {
-            users = std::set<std::string>(it->second.begin(), it->second.end());
+        if (it != globalChannels.end())
+        {
+            users = set<string>(it->second.begin(), it->second.end());
         }
         globalMutex.unlock();
         response["message"] = users;
         ws->send(response.dump(), uWS::TEXT);
         return;
     }
-    
+
     // relay message
     response["message"] = msg["message"];
-    dispatchMessage(std::make_shared<std::string>(userData->channel), std::make_shared<std::string>(response.dump()));    
+    dispatchMessage(make_shared<string>(userData->channel), make_shared<string>(response.dump()));
 }
 
-int main()
+void clusterListener()
 {
-    std::cout << "Starting websocket server on port " << PORT << " using " << THREADS << " threads..." << std::endl;
-    
-    logFile.open("messages.log", std::ios::out | std::ios::app);
-    if(!logFile.is_open()) {
-        std::cout << "Failed to open messages.log file" << std::endl;
+    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSock < 0)
+        return;
+
+    struct sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(clusterPort);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(serverSock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+        return;
+    listen(serverSock, 10);
+
+    cout << "Cluster listener on port " << clusterPort << " online!" << endl;
+
+    while (true)
+    {
+        int clientSock = accept(serverSock, nullptr, nullptr);
+        if (clientSock < 0)
+            continue;
+
+        char buffer[1024] = {0};
+        int bytesRead = read(clientSock, buffer, 1024);
+        if (bytesRead > 0)
+        {
+            string data(buffer);
+            size_t delimiter = data.find("|");
+            if (delimiter != string::npos)
+            {
+                string channel = data.substr(0, delimiter);
+                string message = data.substr(delimiter + 1);
+
+                // cout << "Cluster message: " << channel << " " << message << endl;
+
+                dispatchMessage(make_shared<string>(channel), make_shared<string>(message));
+            }
+        }
+        close(clientSock);
+    }
+}
+
+void parseClusterNodes(const string &nodes)
+{
+    size_t pos = 0;
+    string temp = nodes;
+    while ((pos = temp.find(',')) != string::npos)
+    {
+        clusterNodes.push_back(temp.substr(0, pos));
+        temp.erase(0, pos + 1);
+    }
+
+    if (!temp.empty())
+    {
+        clusterNodes.push_back(temp);
+    }
+}
+
+void parseArguments(int argc, char *argv[])
+{
+    string nodes;
+    string cluster_port;
+    string port;
+    string threads;
+
+    for (int i = 1; i < argc; i++)
+    {
+        string arg = argv[i];
+        if (arg == "--clusters" && i + 1 < argc)
+        {
+            nodes = argv[i + 1];
+        }
+        if (arg == "--cluster-port" && i + 1 < argc)
+        {
+            cluster_port = argv[i + 1];
+        }
+        if (arg == "--port" && i + 1 < argc)
+        {
+            port = argv[i + 1];
+        }
+        if (arg == "--threads" && i + 1 < argc)
+        {
+            threads = argv[i + 1];
+        }
+    }
+
+    if (nodes.empty())
+    {
+        char *envClusters = getenv("CLUSTER_NODES");
+        if (envClusters)
+        {
+            nodes = string(envClusters);
+        }
+    }
+
+    if (cluster_port.empty())
+    {
+        char *envClusterPort = getenv("CLUSTER_PORT");
+        if (envClusterPort)
+        {
+            cluster_port = string(envClusterPort);
+        }
+    }
+
+    if (port.empty())
+    {
+        char *envPort = getenv("PORT");
+        if (envPort)
+        {
+            port = string(envPort);
+        }
+    }
+
+    if (threads.empty())
+    {
+        char *envThreads = getenv("THREADS");
+        if (envThreads)
+        {
+            threads = string(envThreads);
+        }
+    }
+
+    if (!nodes.empty())
+    {
+        parseClusterNodes(nodes);
+    }
+
+    if (!cluster_port.empty())
+    {
+        clusterPort = stoi(cluster_port);
+    }
+
+    if (!port.empty())
+    {
+        serverPort = stoi(port);
+    }
+
+    if (!threads.empty())
+    {
+        threadCount = stoi(threads);
+    }
+
+    if (!clusterNodes.empty())
+    {
+        cout << "Starting websocket server (clusterized, nodes: ";
+        for (const auto &node : clusterNodes)
+        {
+            cout << node << " ";
+        }
+        cout << ") on port " << serverPort << " using " << threadCount << " threads..." << endl;
+    }
+    else
+    {
+        cout << "Starting websocket server (no clustered) on port " << serverPort << " using " << threadCount << " threads..." << endl;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    parseArguments(argc, argv);
+
+    logFile.open("messages.log", ios::out | ios::app);
+    if (!logFile.is_open())
+    {
+        cout << "Failed to open messages.log file" << endl;
         return 1;
     }
 
-    for(int index = 0; index < THREADS; ++index) {    
-        threads[index] = new std::thread([index] {
+    thread clusterThread(clusterListener);
+
+    for (int index = 0; index < threadCount; ++index)
+    {
+        threads[index] = new thread([index]
+                                    {
             ChannelsMap* channels = new ChannelsMap();
 
             mutexes[index].lock();
@@ -208,14 +446,13 @@ int main()
             mutexes[index].unlock();            
             
             uWS::TemplatedApp<SSL>()
-                .get("/*", [](auto *res, auto *req) {
+                .get("/", [](auto *res, auto *req) {
                     res->writeHeader("Content-Type", "application/json")->end("{\"status\":\"ok\"}");
                 })
-                .get("/api", [](auto *res, auto *req) {
+                .get("/usage", [](auto *res, auto *req) {
                     nlohmann::json resp;
-                    
-                    // return date format: 2021-01-01T00:00:00Z
-                    resp["date"] = std::to_string(std::time(nullptr));
+
+                    resp["date"] = getCurrentTimeAsString();
                     resp["connections"] = connections.load();
                     resp["packets"] = packets.load();
                     resp["exceptions"] = exceptions.load();
@@ -226,13 +463,13 @@ int main()
                 .ws<PerSocketData>("/*", {
                 .compression = uWS::SHARED_COMPRESSOR,
                 .maxPayloadLength = 64 * 1024,
-                .idleTimeout = 12,
+                .idleTimeout = 30,
                 .maxBackpressure = 256 * 1024,
                 .upgrade = nullptr,
                 .open = [](uWS::WebSocket<SSL, true> *ws) {
                     connections += 1;
                 },
-                .message = [&channels](auto *ws, std::string_view message, uWS::OpCode opCode) {
+                .message = [&channels](auto *ws, string_view message, uWS::OpCode opCode) {
                     if(opCode != uWS::TEXT || message.size() > 64 * 1024) {
                         return;
                     }
@@ -247,9 +484,9 @@ int main()
                 .drain = nullptr,
                 .ping = nullptr,
                 .pong = nullptr,                
-                .close = [&channels](uWS::WebSocket<SSL, true> *ws, int code, std::string_view message) {
-                    std::string& name = ((PerSocketData*)(ws->getUserData()))->name;
-                    std::string& channel = ((PerSocketData*)(ws->getUserData()))->channel;
+                .close = [&channels](uWS::WebSocket<SSL, true> *ws, int code, string_view message) {
+                    string& name = ((PerSocketData*)(ws->getUserData()))->name;
+                    string& channel = ((PerSocketData*)(ws->getUserData()))->channel;
                     if(!channel.empty()) {
                         auto it = channels->find(channel);
                         if(it != channels->end()) {
@@ -273,9 +510,9 @@ int main()
                     globalMutex.unlock();
                     connections -= 1;
                 }
-            }).listen(PORT, [index](auto *token) {
+            }).listen(serverPort, [index](auto *token) {
                 if (!token) {
-                    std::cout << "Thread " << index << " failed to listen on port " << PORT << std::endl;
+                    cout << "Thread " << index << " failed to listen on port " << serverPort << endl;
                 }
             }).run();
             
@@ -283,25 +520,28 @@ int main()
             threads_data[index].loop = nullptr;
             threads_data[index].channels = nullptr;
             delete channels;
-            mutexes[index].unlock();
-        });
+            mutexes[index].unlock(); });
     };
-    
-    std::cout << "Server online!" << std::endl;
+
+    cout << "Server online!" << endl;
 
     bool working = true;
-    while(working) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cout << "Connections: " << connections << " Packets: " << packets << " Exceptions: " << exceptions << " Blocked: " << blocked << std::endl;
-        
+    while (working)
+    {
+        this_thread::sleep_for(chrono::milliseconds(2500));
+        cout << "Connections: " << connections << " Packets: " << packets << " Exceptions: " << exceptions << " Blocked: " << blocked << endl;
+
         // send ping
         sendPing();
-        
+
         working = false;
-        for(int index = 0; index < THREADS; ++index) {
-            std::lock_guard<std::mutex> lock(mutexes[index]);
-            if(!threads_data[index].loop) {
-                if(threads[index]) {
+        for (int index = 0; index < threadCount; ++index)
+        {
+            lock_guard<mutex> lock(mutexes[index]);
+            if (!threads_data[index].loop)
+            {
+                if (threads[index])
+                {
                     threads[index]->join();
                     delete threads[index];
                     threads[index] = nullptr;
@@ -309,7 +549,7 @@ int main()
                 continue;
             }
             working = true;
-        }        
+        }
     }
     return 0;
 }

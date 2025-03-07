@@ -24,7 +24,7 @@ using namespace std;
 
 vector<string> clusterNodes;
 int serverPort = 8000;
-int clusterPort = 8030;
+int clusterPort = 8035;
 int threadCount = 4;
 
 using ChannelsMap = map<string, set<uWS::WebSocket<SSL, true> *>>;
@@ -332,7 +332,7 @@ void parseArguments(int argc, char *argv[])
     for (int i = 1; i < argc; i++)
     {
         string arg = argv[i];
-        if (arg == "--clusters" && i + 1 < argc)
+        if (arg == "--cluster-nodes" && i + 1 < argc)
         {
             nodes = argv[i + 1];
         }
